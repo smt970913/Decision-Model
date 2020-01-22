@@ -1,0 +1,429 @@
+---
+title: "Final Project"
+author: "Maotong Sun; Qiuyi Chen; Cheng Yao"
+date: "12/7/2019"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Chassis Leasing and Selection Policy for Port Operations
+
+- We present and describe the implementation of a solution methodology and addresses the two decision problems:
+  - The optimal fleet size for leased chassis.
+  - A real-time decision policy for selecting between rental and leased chassis as containers arrive.
+
+## Data Generation
+
+- Our optimization model requires the arrival times of all individual containers and the container dwell time.
+  - The correlation between dwell times and arrival times is -0.015, so they should be uncorrelated.
+  - We used 52 weeks for a year, and divided them into 728 half-day periods.
+  - In our model, we assume a chassis is a available for reuse in the period following its release from a previous order, which      means that a leased chassis returned in the morning can be redeployed in the afternoon.
+
+- Based on the history of the arrival data, the order arrival rate could be approriately modeled as three distinct regimes:
+  - Regime: Busy
+    - Week range: 39-44; Mean: 415; Std: 63; Range: 352-524
+  - Regime: Low
+    - Week range: 1-3 and 48-52; Mean: 58; Std: 19; Range: 36-100
+  - Regime: Moderate
+    - Week range: 4-38 and 45-47; Mean: 209; Std: 59; Range: 118-337
+- We fitted the weekly arrival totals as truncated normal distributions with input parameters above
+
+```{r}
+library(truncnorm)
+library(EnvStats)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(ROI)
+library(ROI.plugin.clp)
+library(ompr)
+library(ompr.roi)
+
+busy <- rtruncnorm(6, a = 352, b = 524, mean = 415, sd = 63)
+low <- rtruncnorm(8, a = 36, b = 100, mean = 58, sd = 19)
+moderate <- rtruncnorm(38, a = 118, b = 337, mean = 209, sd = 59)
+busy <- round(busy)
+low <- round(low)
+moderate <- round(moderate)
+
+# Weekly order arrivals
+WOA<-c(busy,low,moderate)
+```
+
+- The history data also showed that the overall day-of-week distribution for arrivals did not vary significantly across our seasons, followings are these percentages:
+```{r}
+# Distribution of Orders Arrivals by Day of Week
+daily_percentage <- c(0.2,0.21,0.19,0.16,0.19,0.05,0)
+cum_dailyPer <- cumsum(daily_percentage)
+```
+
+- We also need to generate the dwell times according to its empirical distribution.
+```{r}
+# Dwell time
+prob <- c(0.105,0.209,0.156,0.116,0.076,0.074,0.056,0.056,0.033,0.030,0.025,0.021,0.011,0.017,0.005,0.010)
+a <- c(1:16)
+n <- sum(WOA)
+nn <- n*prob
+nn <- round(nn)
+```
+- Following is the histogram depicting the distribution of historical container dwell times
+```{r}
+data <- function(nn,a){
+  data <- runif(nn,a,a+1)
+  data
+}
+
+result <- unlist(mapply(data,nn,a))
+
+dwelltime<-remp(1000,result)
+dwelltime <- round(dwelltime)
+hist(dwelltime)
+```
+
+## Build the order-period incidence matrix M(i,p)
+- We define $M(i,p)=1$ if the order $i$ container requires a chassis in period $p$ and $0$ otherwise.
+
+```{r}
+# Generate 1000 simulated realizations of order arrivals and dwell times
+numSimulated <- 1000
+
+s_busy <- sum(busy)
+s_low <- sum(low)
+s_moderate <- sum(moderate)
+ss <- s_busy + s_low + s_moderate
+
+Busy_week <- seq(39, 44)
+Low_week <- c(seq(1, 3), seq(48, 52))
+Moderate_week <- c(seq(4, 38), seq(45, 47))
+
+M <- matrix(rep(0, 728*numSimulated), nrow = numSimulated, ncol = 728)
+
+for (i in 1:numSimulated) {
+  regime <- runif(1)
+  
+  if(regime <= s_busy/ss){
+    w <- sample(Busy_week, 1)
+    hdp_0 <- (w - 1)*14
+    dow <- runif(1)
+    if(dow <= cum_dailyPer[1]){
+      hdp_1 <- hdp_0
+      m_a <- runif(1)
+      if(m_a <= 0.5){
+        hdp_2 <- hdp_1 + 1
+        M[i, hdp_2] <- 1
+        if(hdp_2 + dwelltime[i] >= 728){
+          for (k in 0:(728-hdp_2)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+        else{
+          for (k in 0:(dwelltime[i]-1)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+      }
+      else{
+        hdp_2 <- hdp_1 + 2
+        M[i, hdp_2] <- 1
+        if(hdp_2 + dwelltime[i] >= 728){
+          for (k in 0:(728-hdp_2)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+        else{
+          for (k in 0:(dwelltime[i]-1)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+      }
+    }
+    else{
+      for (j in 2:6) {
+        if(cum_dailyPer[j] >= dow && cum_dailyPer[j - 1] < dow){
+          hdp_1 <- hdp_0 + (j - 1)*2
+          m_a <- runif(1)
+          if(m_a <= 0.5){
+            hdp_2 <- hdp_1 + 1 
+            M[i, hdp_2] <- 1
+            if(hdp_2 + dwelltime[i] >= 728){
+              for (k in 0:(728-hdp_2)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+            else{
+              for (k in 0:(dwelltime[i]-1)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+          }
+          else{
+            hdp_2 <- hdp_1 + 2
+            M[i, hdp_2] <- 1
+            if(hdp_2 + dwelltime[i] >= 728){
+              for (k in 0:(728-hdp_2)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+            else{
+              for (k in 0:(dwelltime[i]-1)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if(regime > s_busy/ss && regime <= (s_busy+s_low)/ss){
+    w <- sample(Low_week, 1)
+    hdp_0 <- (w - 1)*14
+    dow <- runif(1)
+    if(dow <= cum_dailyPer[1]){
+      hdp_1 <- hdp_0
+      m_a <- runif(1)
+      if(m_a <= 0.5){
+        hdp_2 <- hdp_1 + 1
+        M[i, hdp_2] <- 1
+        if(hdp_2 + dwelltime[i] >= 728){
+          for (k in 0:(728-hdp_2)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+        else{
+          for (k in 0:(dwelltime[i]-1)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+      }
+      else{
+        hdp_2 <- hdp_1 + 2
+        M[i, hdp_2] <- 1
+        if(hdp_2 + dwelltime[i] >= 728){
+          for (k in 0:(728-hdp_2)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+        else{
+          for (k in 0:(dwelltime[i]-1)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+      }
+    }
+    else{
+      for (j in 2:6) {
+        if(cum_dailyPer[j] >= dow && cum_dailyPer[j - 1] < dow){
+          hdp_1 <- hdp_0 + (j - 1)*2
+          m_a <- runif(1)
+          if(m_a <= 0.5){
+            hdp_2 <- hdp_1 + 1 
+            M[i, hdp_2] <- 1
+            if(hdp_2 + dwelltime[i] >= 728){
+              for (k in 0:(728-hdp_2)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+            else{
+              for (k in 0:(dwelltime[i]-1)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+          }
+          else{
+            hdp_2 <- hdp_1 + 2
+            M[i, hdp_2] <- 1
+            if(hdp_2 + dwelltime[i] >= 728){
+              for (k in 0:(728-hdp_2)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+            else{
+              for (k in 0:(dwelltime[i]-1)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  if(regime > (s_busy+s_low)/ss){
+    w <- sample(Moderate_week, 1)
+    hdp_0 <- (w - 1)*14
+    dow <- runif(1)
+    if(dow <= cum_dailyPer[1]){
+      hdp_1 <- hdp_0
+      m_a <- runif(1)
+      if(m_a <= 0.5){
+        hdp_2 <- hdp_1 + 1
+        M[i, hdp_2] <- 1
+        if(hdp_2 + dwelltime[i] >= 728){
+          for (k in 0:(728-hdp_2)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+        else{
+          for (k in 0:(dwelltime[i]-1)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+      }
+      else{
+        hdp_2 <- hdp_1 + 2
+        M[i, hdp_2] <- 1
+        if(hdp_2 + dwelltime[i] >= 728){
+          for (k in 0:(728-hdp_2)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+        else{
+          for (k in 0:(dwelltime[i]-1)) {
+            M[i, hdp_2+k] <- 1
+          }
+        }
+      }
+    }
+    else{
+      for (j in 2:6) {
+        if(cum_dailyPer[j] >= dow && cum_dailyPer[j - 1] < dow){
+          hdp_1 <- hdp_0 + (j - 1)*2
+          m_a <- runif(1)
+          if(m_a <= 0.5){
+            hdp_2 <- hdp_1 + 1 
+            M[i, hdp_2] <- 1
+            if(hdp_2 + dwelltime[i] >= 728){
+              for (k in 0:(728-hdp_2)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+            else{
+              for (k in 0:(dwelltime[i]-1)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+          }
+          else{
+            hdp_2 <- hdp_1 + 2
+            M[i, hdp_2] <- 1
+            if(hdp_2 + dwelltime[i] >= 728){
+              for (k in 0:(728-hdp_2)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+            else{
+              for (k in 0:(dwelltime[i]-1)) {
+                M[i, hdp_2+k] <- 1
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+## Optimization Model
+- **Decision Variables**
+  - $Nt$: total number of chassis to be leased in advance for the time period spanned by the collection of orders.
+  - $x_i$: indicator of chassis selection, $x_i = 1$ for order $i$ is assigned to a leased chassis, and $x_i = 0$ for order       $i$ is assigned to a rental chassis
+- **Problem Data**
+  - $D_i$: dwell time (in half-day periods) of order $i$
+  - $C_R$: per-period chassis rental cost
+  - $C_L$: per-chassis annual lease cost
+  - $M(i,p)$: the order-period incidence matrix
+- **Objective function**
+  - $\min \; \sum_i (1-x_i) D_i C_R + N_t C_L$
+- **Constraint**
+  - $\sum_i M(i, p) x_i \le N_t$
+  
+```{r}
+# Cost
+rental_daily<-19
+leased_annual<-2972
+
+# Optimization Model
+chassisLeasing_ompr <- MIPModel() %>%
+  add_variable(chassisSelect[i], i = 1:numSimulated,
+               type = "binary") %>%
+  add_variable(Nt, type = "integer", lb = 0) %>%
+  set_objective(sum_expr((1 - chassisSelect[i])*dwelltime[i]*(rental_daily/2), i = 1:numSimulated) + 
+                  Nt*leased_annual, sense = "min") %>%
+  add_constraint(sum_expr(chassisSelect[i]*M[i,j], i = 1:numSimulated) <= Nt, j = 1:728) %>%
+  solve_model(with_ROI(solver = "glpk"))
+
+chassisLeasing_ompr %>% 
+  get_solution(chassisSelect[i])
+chassisLeasing_ompr %>%
+  get_solution(Nt)
+```
+
+## Observations and Conclusion
+```{r}
+cs <- chassisLeasing_ompr %>% 
+  get_solution(chassisSelect[i])
+n_t <- chassisLeasing_ompr %>%
+  get_solution(Nt)
+
+# Orders using leased chassis
+Olc <- sum(cs$value)
+# Orders using rental chassis
+Orc <- numSimulated - sum(cs$value)
+
+# Optimized cost
+opCost <- 0
+for (i in 1:numSimulated) {
+  opCost <- opCost + (1-cs$value[i])*dwelltime[i]*(rental_daily/2)
+}
+opCost <- opCost + n_t*leased_annual
+
+print(n_t)
+print(Olc)
+print(opCost)
+```
+- We have also tried 100 simulations, which shows us only one leased chassis.
+- For 1000 simulations, we can have 8 leased chassis, and it would be used for 714 orders.
+- The rest of the orders can use rental chassis.
+- For our 1000 simulations, the optimized cost is 
+
+## Predictive Model
+- We built a logistic regression model investigating the relationship between the choice of chassis leasing and the following   predictor variables on the day the order (container) arrived and was processed:
+  - Estimated dwell for each order (dwelltime)
+  - Total daily orders for pick up (DOP)
+  - Whether the planned chassis drop is morning(1) or afternoon(0) (MA)
+```{r}
+## Predictive Model
+Opt <- cs$value
+
+startDate <- rep(0, numSimulated)
+for (i in 1:length(startDate)) {
+  startDate[i] <- min(which(M[i,] == 1))
+}
+
+# Total daily orders for pick up
+DOP <- rep(0, numSimulated)
+for (i in 1:numSimulated) {
+  DOP[i] <- sum(M[,startDate[i]])
+}
+
+# Whether the planned chassis drop is morning(1) or afternoon(0)
+MA <- rep(0, numSimulated)
+for (i in 1:numSimulated) {
+  if(startDate[i]%%2 == 1){
+    MA[i] <- 1
+  }
+}
+
+preModel <- glm(formula = Opt ~ dwelltime + DOP + MA, family = binomial())
+summary(preModel)
+```
+- The result illustrates that the selection policy for the chassis leasing is highly related with the dwell time of the oder and the total daily orders for pick up of its start date.
