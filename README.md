@@ -1,5 +1,5 @@
 # Decision-Model
-2019fall Decision Model class
+2019Fall Decision Model class
 Course Topics:
   1. Introduction to Decision Making under Uncertainty
   2. Review of Probability
